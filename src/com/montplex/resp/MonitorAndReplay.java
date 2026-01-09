@@ -40,8 +40,8 @@ import java.util.concurrent.*;
 @CommandLine.Command(name = "java -jar pcap_resp_replay-1.0.0.jar", version = "1.0.0",
         description = "TCP monitor / filter and then replay / redirect to target redis server.")
 class MonitorAndReplay implements Callable<Integer> {
-    @CommandLine.Option(names = {"-i", "--interface"}, description = "interface, eg: eth0")
-    String itf = "enp4s0";
+    @CommandLine.Option(names = {"-i", "--interface"}, description = "interface, eg: lo, default: lo")
+    String itf = "lo";
 
     @CommandLine.Option(names = {"-p", "--port"}, description = "port, eg: 6379")
     int port = 6379;
@@ -107,39 +107,42 @@ class MonitorAndReplay implements Callable<Integer> {
         buf.writeBytes(rawBytes);
 
         var data = resp.decode(buf);
+        while (data != null) {
+            log.debug("data length: {}", data.length);
+            log.debug("timestamp: {}", timestamp);
 
-        log.debug("data length: {}", data.length);
-        log.debug("timestamp: {}", timestamp);
-
-        for (var d : data) {
-            if (d == null) {
-                // not received yet
-                invalidRespDataCount++;
-                return;
+            for (var d : data) {
+                if (d == null) {
+                    // not received yet
+                    invalidRespDataCount++;
+                    break;
+                }
             }
-        }
 
-        validRespDataCount++;
+            validRespDataCount++;
 
-        var cmd = new String(data[0]).toLowerCase();
-        var count = countByCmd.getOrDefault(cmd, 0L);
-        countByCmd.put(cmd, count + 1);
-        if (Category.isReadCmd(cmd)) {
-            readCmdCount++;
-            var n = forwardCommand(cmd, data, true);
-            forwardReadCount += n;
-            if (n != readScale) {
-                forwardReadErrorCount += (readScale - n);
+            var cmd = new String(data[0]).toLowerCase();
+            var count = countByCmd.getOrDefault(cmd, 0L);
+            countByCmd.put(cmd, count + 1);
+            if (Category.isReadCmd(cmd)) {
+                readCmdCount++;
+                var n = forwardCommand(cmd, data, true);
+                forwardReadCount += n;
+                if (n != readScale) {
+                    forwardReadErrorCount += (readScale - n);
+                }
+            } else if (Category.isWriteCmd(cmd)) {
+                writeCmdCount++;
+                var n = forwardCommand(cmd, data, false);
+                forwardWriteCount += n;
+                if (n != writeScale) {
+                    forwardWriteErrorCount += (writeScale - n);
+                }
+            } else {
+                log.debug("not read or write, cmd: {}", cmd);
             }
-        } else if (Category.isWriteCmd(cmd)) {
-            writeCmdCount++;
-            var n = forwardCommand(cmd, data, false);
-            forwardWriteCount += n;
-            if (n != writeScale) {
-                forwardWriteErrorCount += (writeScale - n);
-            }
-        } else {
-            log.debug("not read or write, cmd: {}", cmd);
+
+            data = resp.decode(buf);
         }
 
         if (validRespDataCount % 1_00_000 == 0) {
