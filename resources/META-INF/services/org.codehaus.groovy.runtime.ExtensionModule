@@ -1,3 +1,0 @@
-moduleName=groovy-ext-console-color
-moduleVersion=4.0.12
-extensionClasses=com.montplex.tools.ConsoleColorExtensions
