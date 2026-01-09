@@ -28,6 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import picocli.CommandLine;
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.exceptions.JedisConnectionException;
 import redis.clients.jedis.exceptions.JedisException;
 
 import java.sql.Timestamp;
@@ -42,6 +43,9 @@ import java.util.concurrent.*;
 class MonitorAndReplay implements Callable<Integer> {
     @CommandLine.Option(names = {"-i", "--interface"}, description = "interface, eg: lo, default: lo")
     String itf = "lo";
+
+    @CommandLine.Option(names = {"-h", "--host"}, description = "host, eg: localhost")
+    String host = "localhost";
 
     @CommandLine.Option(names = {"-p", "--port"}, description = "port, eg: 6379")
     int port = 6379;
@@ -76,6 +80,9 @@ class MonitorAndReplay implements Callable<Integer> {
     @CommandLine.Option(names = {"-t", "--send-cmd-threads"}, description = "send cmd threads, default: 1")
     int sendCmdThreads = 1;
 
+    @CommandLine.Option(names = {"-d", "--debug"}, description = "debug mode, if true, just log resp data, skip execute to target redis server")
+    boolean isDebug = false;
+
     private final Logger log = LoggerFactory.getLogger(this.getClass());
 
     private final RESP resp = new RESP();
@@ -108,9 +115,6 @@ class MonitorAndReplay implements Callable<Integer> {
 
         var data = resp.decode(buf);
         while (data != null) {
-            log.debug("data length: {}", data.length);
-            log.debug("timestamp: {}", timestamp);
-
             for (var d : data) {
                 if (d == null) {
                     // not received yet
@@ -167,6 +171,19 @@ class MonitorAndReplay implements Callable<Integer> {
     private ExecutorService executor;
 
     private int forwardCommand(String cmd, byte[][] data, boolean isRead) {
+        if (isDebug) {
+            var sb = new StringBuilder();
+            for (int i = 0; i < data.length; i++) {
+                var bytes = data[i];
+                sb.append(new String(bytes));
+                if (i != data.length - 1) {
+                    sb.append(" ");
+                }
+            }
+            log.info(sb.toString());
+            return isRead ? readScale : writeScale;
+        }
+
         if (isUseLettuce) {
             List<StatefulRedisConnection<byte[], byte[]>> connections = isRead ? readConnections : writeConnections;
             int n = 0;
@@ -236,6 +253,8 @@ class MonitorAndReplay implements Callable<Integer> {
 
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
+    private Jedis jedisSourceServer;
+
     private int getFromSystemProperty(String key, int defaultValue) {
         var value = System.getProperty(key);
         if (value == null) {
@@ -247,6 +266,7 @@ class MonitorAndReplay implements Callable<Integer> {
     @Override
     public Integer call() throws Exception {
         log.info("interface: {}", itf);
+        log.info("host: {}", host);
         log.info("port: {}", port);
         log.info("targetHost: {}", targetHost);
         log.info("targetPort: {}", targetPort);
@@ -257,6 +277,8 @@ class MonitorAndReplay implements Callable<Integer> {
         log.info("runningSeconds: {}", runningSeconds);
         log.info("readScale: {}", readScale);
         log.info("writeScale: {}", writeScale);
+        log.info("sendCmdThreads: {}", sendCmdThreads);
+        log.info("isDebug: {}", isDebug);
 
         final int maxRunningSeconds = getFromSystemProperty("maxRunningSeconds", 36000);
         if (runningSeconds > maxRunningSeconds) {
@@ -270,7 +292,7 @@ class MonitorAndReplay implements Callable<Integer> {
             return 1;
         }
 
-        if (sendCmdThreads > 1) {
+        if (sendCmdThreads > 1 && !isDebug) {
             executor = Executors.newFixedThreadPool(sendCmdThreads);
         }
 
@@ -282,6 +304,14 @@ class MonitorAndReplay implements Callable<Integer> {
         final int maxWriteScale = getFromSystemProperty("maxWriteScale", 100);
         if (writeScale > maxWriteScale) {
             log.warn("write scale is too large, max: {}", maxWriteScale);
+            return 1;
+        }
+
+        try {
+            jedisSourceServer = new Jedis(host, port);
+            jedisSourceServer.ping();
+        } catch (JedisConnectionException e) {
+            log.warn("Failed to connect to redis server, host: {}, port: {}, error: {}", host, port, e.getMessage());
             return 1;
         }
 
@@ -299,6 +329,16 @@ class MonitorAndReplay implements Callable<Integer> {
         scheduler.schedule(() -> {
             log.info("running seconds: {}", runningSeconds);
             stop = true;
+
+            // trigger packets received
+            for (int i = 0; i < 10; i++) {
+                jedisSourceServer.ping();
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException ignore) {
+                }
+            }
+            jedisSourceServer.close();
         }, runningSeconds, TimeUnit.SECONDS);
 
         var isLocalDebug = System.getProperty("localDebug") != null;
@@ -413,6 +453,10 @@ class MonitorAndReplay implements Callable<Integer> {
     private final boolean isUseLettuce = getFromSystemProperty("useLettuce", 0) == 1;
 
     private void initializeConnections() {
+        if (isDebug) {
+            return;
+        }
+
         if (isUseLettuce) {
             log.info("use lettuce");
             redisClient = RedisClient.create(RedisURI.create(targetHost, targetPort));
@@ -444,6 +488,10 @@ class MonitorAndReplay implements Callable<Integer> {
     }
 
     private void closeConnections() {
+        if (isDebug) {
+            return;
+        }
+
         if (isUseLettuce) {
             readConnections.forEach(conn -> {
                 if (conn != null && !conn.isOpen()) {
