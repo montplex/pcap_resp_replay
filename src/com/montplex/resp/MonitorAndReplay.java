@@ -126,19 +126,17 @@ class MonitorAndReplay implements Callable<Integer> {
         countByCmd.put(cmd, count + 1);
         if (Category.isReadCmd(cmd)) {
             readCmdCount++;
-            var success = forwardCommand(cmd, data, true);
-            if (success) {
-                forwardReadCount++;
-            } else {
-                forwardReadErrorCount++;
+            var n = forwardCommand(cmd, data, true);
+            forwardReadCount += n;
+            if (n != readScale) {
+                forwardReadErrorCount += (readScale - n);
             }
         } else if (Category.isWriteCmd(cmd)) {
             writeCmdCount++;
-            var success = forwardCommand(cmd, data, false);
-            if (success) {
-                forwardWriteCount++;
-            } else {
-                forwardWriteErrorCount++;
+            var n = forwardCommand(cmd, data, false);
+            forwardWriteCount += n;
+            if (n != writeScale) {
+                forwardWriteErrorCount += (writeScale - n);
             }
         } else {
             log.debug("not read or write, cmd: {}", cmd);
@@ -165,25 +163,27 @@ class MonitorAndReplay implements Callable<Integer> {
 
     private ExecutorService executor;
 
-    private boolean forwardCommand(String cmd, byte[][] data, boolean isRead) {
+    private int forwardCommand(String cmd, byte[][] data, boolean isRead) {
         if (isUseLettuce) {
             List<StatefulRedisConnection<byte[], byte[]>> connections = isRead ? readConnections : writeConnections;
+            int n = 0;
             for (var connection : connections) {
                 var async = connection.async();
                 try {
                     var future = executeCommand(async, cmd, data);
-                    if (future == null) {
-                        return false;
+                    if (future != null) {
+                        n++;
                     }
                 } catch (Exception e) {
-                    log.error("Failed to forward command, error: {}", e.getMessage());
-                    return false;
+                    log.error("Failed to execute command, err: {}", e.getMessage());
                 }
             }
+            return n;
         } else {
             List<Jedis> list = isRead ? jedisReadList : jedisWriteList;
             var args = new byte[data.length - 1][];
             System.arraycopy(data, 1, args, 0, args.length);
+            int n = 0;
             for (var jedis : list) {
                 if (sendCmdThreads > 1) {
                     executor.execute(() -> {
@@ -192,22 +192,23 @@ class MonitorAndReplay implements Callable<Integer> {
                         } catch (JedisException ignore) {
                             // ok
                         } catch (Exception e) {
-                            log.error("Failed to forward command, error: {}", e.getMessage());
+                            log.error("Failed to execute command, err: {}", e.getMessage());
                         }
                     });
+                    n++;
                 } else {
                     try {
                         jedis.sendCommand(new ExtendCommand(cmd), args);
+                        n++;
                     } catch (JedisException ignore) {
                         // ok
                     } catch (Exception e) {
-                        log.error("Failed to forward command, error: {}", e.getMessage());
-                        return false;
+                        log.error("Failed to execute command, err: {}", e.getMessage());
                     }
                 }
             }
+            return n;
         }
-        return true;
     }
 
     private RedisFuture<?> executeCommand(RedisAsyncCommands<byte[], byte[]> async, String cmd, byte[][] data) {
