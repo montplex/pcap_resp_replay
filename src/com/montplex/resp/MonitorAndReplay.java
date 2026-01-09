@@ -27,11 +27,14 @@ import org.pcap4j.packet.UnknownPacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import picocli.CommandLine;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.exceptions.JedisException;
 
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.TreeMap;
 import java.util.concurrent.*;
 
 @CommandLine.Command(name = "java -jar pcap_resp_replay-1.0.0.jar", version = "1.0.0",
@@ -69,6 +72,9 @@ class MonitorAndReplay implements Callable<Integer> {
 
     @CommandLine.Option(names = {"-s", "--running-seconds"}, description = "running seconds, default: 60")
     int runningSeconds = 60;
+
+    @CommandLine.Option(names = {"-t", "--send-cmd-threads"}, description = "send cmd threads, default: 1")
+    int sendCmdThreads = 1;
 
     private final Logger log = LoggerFactory.getLogger(this.getClass());
 
@@ -108,6 +114,7 @@ class MonitorAndReplay implements Callable<Integer> {
         for (var d : data) {
             if (d == null) {
                 // not received yet
+                invalidRespDataCount++;
                 return;
             }
         }
@@ -115,9 +122,11 @@ class MonitorAndReplay implements Callable<Integer> {
         validRespDataCount++;
 
         var cmd = new String(data[0]).toLowerCase();
+        var count = countByCmd.getOrDefault(cmd, 0L);
+        countByCmd.put(cmd, count + 1);
         if (Category.isReadCmd(cmd)) {
             readCmdCount++;
-            var success = forwardCommand(cmd, data, readConnections);
+            var success = forwardCommand(cmd, data, true);
             if (success) {
                 forwardReadCount++;
             } else {
@@ -125,7 +134,7 @@ class MonitorAndReplay implements Callable<Integer> {
             }
         } else if (Category.isWriteCmd(cmd)) {
             writeCmdCount++;
-            var success = forwardCommand(cmd, data, writeConnections);
+            var success = forwardCommand(cmd, data, false);
             if (success) {
                 forwardWriteCount++;
             } else {
@@ -142,6 +151,7 @@ class MonitorAndReplay implements Callable<Integer> {
     }
 
     private long timeoutPacketGetCount = 0L;
+    private long invalidRespDataCount;
     private long validRespDataCount;
     private long readCmdCount = 0L;
     private long writeCmdCount = 0L;
@@ -151,16 +161,53 @@ class MonitorAndReplay implements Callable<Integer> {
     private long forwardWriteCount = 0L;
     private long forwardWriteErrorCount = 0L;
 
-    private boolean forwardCommand(String cmd, byte[][] data, List<StatefulRedisConnection<byte[], byte[]>> connections) {
-        var connection = connections.get(ThreadLocalRandom.current().nextInt(connections.size()));
-        var async = connection.async();
-        try {
-            var future = executeCommand(async, cmd, data);
-            return future != null;
-        } catch (Exception e) {
-            log.error("Failed to forward command, error: {}", e.getMessage());
-            return false;
+    private final TreeMap<String, Long> countByCmd = new TreeMap<>();
+
+    private ExecutorService executor;
+
+    private boolean forwardCommand(String cmd, byte[][] data, boolean isRead) {
+        if (isUseLettuce) {
+            List<StatefulRedisConnection<byte[], byte[]>> connections = isRead ? readConnections : writeConnections;
+            for (var connection : connections) {
+                var async = connection.async();
+                try {
+                    var future = executeCommand(async, cmd, data);
+                    if (future == null) {
+                        return false;
+                    }
+                } catch (Exception e) {
+                    log.error("Failed to forward command, error: {}", e.getMessage());
+                    return false;
+                }
+            }
+        } else {
+            List<Jedis> list = isRead ? jedisReadList : jedisWriteList;
+            var args = new byte[data.length - 1][];
+            System.arraycopy(data, 1, args, 0, args.length);
+            for (var jedis : list) {
+                if (sendCmdThreads > 1) {
+                    executor.execute(() -> {
+                        try {
+                            jedis.sendCommand(new ExtendCommand(cmd), args);
+                        } catch (JedisException ignore) {
+                            // ok
+                        } catch (Exception e) {
+                            log.error("Failed to forward command, error: {}", e.getMessage());
+                        }
+                    });
+                } else {
+                    try {
+                        jedis.sendCommand(new ExtendCommand(cmd), args);
+                    } catch (JedisException ignore) {
+                        // ok
+                    } catch (Exception e) {
+                        log.error("Failed to forward command, error: {}", e.getMessage());
+                        return false;
+                    }
+                }
+            }
         }
+        return true;
     }
 
     private RedisFuture<?> executeCommand(RedisAsyncCommands<byte[], byte[]> async, String cmd, byte[][] data) {
@@ -211,6 +258,16 @@ class MonitorAndReplay implements Callable<Integer> {
         if (runningSeconds > maxRunningSeconds) {
             log.warn("running seconds is too large, max: {}", maxRunningSeconds);
             return 1;
+        }
+
+        final int maxSendCmdThreads = getFromSystemProperty("maxSendCmdThreads", 4);
+        if (sendCmdThreads > maxSendCmdThreads) {
+            log.warn("send cmd threads is too large, max: {}", maxSendCmdThreads);
+            return 1;
+        }
+
+        if (sendCmdThreads > 1) {
+            executor = Executors.newFixedThreadPool(sendCmdThreads);
         }
 
         final int maxReadScale = getFromSystemProperty("maxReadScale", 100);
@@ -279,7 +336,11 @@ class MonitorAndReplay implements Callable<Integer> {
         }
 
         scheduler.shutdown();
+        if (executor != null) {
+            executor.shutdownNow();
+        }
 
+        Thread.sleep(1000 * 5);
         closeConnections();
 
         // print package stats
@@ -291,21 +352,37 @@ class MonitorAndReplay implements Callable<Integer> {
         var headers = toHeaders("ps_recv", "ps_drop", "ps_ifdrop");
         new TablePrinter(headers).print(rows);
 
-        // println read write cmd stats
-        var row2 = toRow(timeoutPacketGetCount, validRespDataCount, readCmdCount, writeCmdCount, validRespDataCount - readCmdCount - writeCmdCount);
+        // print read write cmd stats
+        var row2 = toRow(timeoutPacketGetCount, invalidRespDataCount, validRespDataCount,
+                readCmdCount, writeCmdCount, validRespDataCount - readCmdCount - writeCmdCount);
         var rows2 = new ArrayList<List<String>>();
         rows2.add(row2);
 
-        var headers2 = toHeaders("timeout packet get count", "valid resp data count", "read cmd count", "write cmd count", "other cmd count");
+        var headers2 = toHeaders("timeout packet get count", "invalid resp data count", "valid resp data count",
+                "read cmd count", "write cmd count", "other cmd count");
         new TablePrinter(headers2).print(rows2);
 
-        // println forward stats
+        // print forward stats
         var row3 = toRow(forwardReadCount, forwardReadErrorCount, forwardWriteCount, forwardWriteErrorCount);
         var rows3 = new ArrayList<List<String>>();
         rows3.add(row3);
 
         var headers3 = toHeaders("forward read count", "forward read error count", "forward write count", "forward write error count");
         new TablePrinter(headers3).print(rows3);
+
+        // print cmd count
+        var rows4 = new ArrayList<List<String>>();
+        for (var entry : countByCmd.entrySet()) {
+            var cmd = entry.getKey();
+            var count = entry.getValue();
+            var row4 = new ArrayList<String>();
+            row4.add(cmd);
+            row4.add("" + count);
+            rows4.add(row4);
+        }
+
+        var header4 = toHeaders("cmd", "count");
+        new TablePrinter(header4).print(rows4);
 
         return 0;
     }
@@ -326,38 +403,77 @@ class MonitorAndReplay implements Callable<Integer> {
     private final List<StatefulRedisConnection<byte[], byte[]>> readConnections = new ArrayList<>();
     private final List<StatefulRedisConnection<byte[], byte[]>> writeConnections = new ArrayList<>();
 
+    private final List<Jedis> jedisReadList = new ArrayList<>();
+    private final List<Jedis> jedisWriteList = new ArrayList<>();
+
+    private final boolean isUseLettuce = getFromSystemProperty("useLettuce", 0) == 1;
+
     private void initializeConnections() {
-        redisClient = RedisClient.create(RedisURI.create(targetHost, targetPort));
+        if (isUseLettuce) {
+            log.info("use lettuce");
+            redisClient = RedisClient.create(RedisURI.create(targetHost, targetPort));
 
-        for (int i = 0; i < readScale; i++) {
-            var connection = redisClient.connect(ByteArrayCodec.INSTANCE);
-            readConnections.add(connection);
-        }
-        log.info("read connections created");
+            for (int i = 0; i < readScale; i++) {
+                var connection = redisClient.connect(ByteArrayCodec.INSTANCE);
+                readConnections.add(connection);
+            }
 
-        for (int i = 0; i < writeScale; i++) {
-            var connection = redisClient.connect(ByteArrayCodec.INSTANCE);
-            writeConnections.add(connection);
+            for (int i = 0; i < writeScale; i++) {
+                var connection = redisClient.connect(ByteArrayCodec.INSTANCE);
+                writeConnections.add(connection);
+            }
+        } else {
+            log.info("use jedis");
+            for (int i = 0; i < readScale; i++) {
+                var jedis = new Jedis(targetHost, targetPort);
+                jedisReadList.add(jedis);
+            }
+
+            for (int i = 0; i < writeScale; i++) {
+                var jedis = new Jedis(targetHost, targetPort);
+                jedisWriteList.add(jedis);
+            }
         }
+
         log.info("write connections created");
+        log.info("read connections created");
     }
 
     private void closeConnections() {
-        readConnections.forEach(conn -> {
-            if (conn != null && !conn.isOpen()) {
-                conn.close();
-            }
-        });
+        if (isUseLettuce) {
+            readConnections.forEach(conn -> {
+                if (conn != null && !conn.isOpen()) {
+                    conn.close();
+                }
+            });
+            writeConnections.forEach(conn -> {
+                if (conn != null && !conn.isOpen()) {
+                    conn.close();
+                }
+            });
+            redisClient.shutdown();
+        } else {
+            jedisReadList.forEach(jedis -> {
+                if (jedis != null && jedis.isConnected()) {
+                    try {
+                        jedis.disconnect();
+                    } catch (Exception ignore) {
+
+                    }
+                }
+            });
+            jedisWriteList.forEach(jedis -> {
+                if (jedis != null && jedis.isConnected()) {
+                    try {
+                        jedis.disconnect();
+                    } catch (Exception ignore) {
+
+                    }
+                }
+            });
+        }
         log.info("read connections closed");
-
-        writeConnections.forEach(conn -> {
-            if (conn != null && !conn.isOpen()) {
-                conn.close();
-            }
-        });
         log.info("write connections closed");
-
-        redisClient.shutdown();
     }
 
     public static void main(String[] args) {
