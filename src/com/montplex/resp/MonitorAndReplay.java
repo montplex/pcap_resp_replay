@@ -1,5 +1,6 @@
 package com.montplex.resp;
 
+import com.montplex.monitor.BigKeyTopK;
 import com.montplex.tools.TablePrinter;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisFuture;
@@ -62,7 +63,7 @@ class MonitorAndReplay implements Callable<Integer> {
     @CommandLine.Option(names = {"-W", "--write-scale"}, description = "write scale, default: 1")
     int writeScale = 1;
 
-    @CommandLine.Option(names = {"-r", "--read-timeout"}, description = "read timeout seconds, default: 10")
+    @CommandLine.Option(names = {"-r", "--read-timeout"}, description = "read timeout seconds by capture from network interface, default: 10")
     int readTimeout = 10;
 
     @CommandLine.Option(names = {"-b", "--buffer-size"}, description = "buffer size, default: 65536")
@@ -79,6 +80,9 @@ class MonitorAndReplay implements Callable<Integer> {
 
     @CommandLine.Option(names = {"-t", "--send-cmd-threads"}, description = "send cmd threads, default: 1")
     int sendCmdThreads = 1;
+
+    @CommandLine.Option(names = {"-m", "--big-key-top-num"}, description = "big key top num, default: 10")
+    int bigKeyTopNum = 10;
 
     @CommandLine.Option(names = {"-d", "--debug"}, description = "debug mode, if true, just log resp data, skip execute to target redis server")
     boolean isDebug = false;
@@ -136,6 +140,8 @@ class MonitorAndReplay implements Callable<Integer> {
                     forwardReadErrorCount += (readScale - n);
                 }
             } else if (Category.isWriteCmd(cmd)) {
+                checkBigKey(cmd, data);
+
                 writeCmdCount++;
                 var n = forwardCommand(cmd, data, false);
                 forwardWriteCount += n;
@@ -155,6 +161,18 @@ class MonitorAndReplay implements Callable<Integer> {
         }
     }
 
+    private void checkBigKey(String cmd, byte[][] data) {
+        // only support set
+        if (!cmd.equals("set") || data.length != 3) {
+            return;
+        }
+
+        var key = new String(data[1]);
+        var valueLength = data[2].length;
+
+        bigKeyTopK.add(key, valueLength);
+    }
+
     private long timeoutPacketGetCount = 0L;
     private long invalidRespDataCount;
     private long validRespDataCount;
@@ -167,6 +185,7 @@ class MonitorAndReplay implements Callable<Integer> {
     private long forwardWriteErrorCount = 0L;
 
     private final TreeMap<String, Long> countByCmd = new TreeMap<>();
+    private BigKeyTopK bigKeyTopK;
 
     private ExecutorService executor;
 
@@ -278,6 +297,7 @@ class MonitorAndReplay implements Callable<Integer> {
         log.info("readScale: {}", readScale);
         log.info("writeScale: {}", writeScale);
         log.info("sendCmdThreads: {}", sendCmdThreads);
+        log.info("bigKeyTopNum: {}", bigKeyTopNum);
         log.info("isDebug: {}", isDebug);
 
         final int maxRunningSeconds = getFromSystemProperty("maxRunningSeconds", 36000);
@@ -306,6 +326,8 @@ class MonitorAndReplay implements Callable<Integer> {
             log.warn("write scale is too large, max: {}", maxWriteScale);
             return 1;
         }
+
+        bigKeyTopK = new BigKeyTopK(bigKeyTopNum);
 
         try {
             jedisSourceServer = new Jedis(host, port);
@@ -427,6 +449,21 @@ class MonitorAndReplay implements Callable<Integer> {
 
         var header4 = toHeaders("cmd", "count");
         new TablePrinter(header4).print(rows4);
+
+        // print big key top n
+        var queue = bigKeyTopK.getQueue();
+        if (!queue.isEmpty()) {
+            var rows5 = new ArrayList<List<String>>();
+            for (var one : queue) {
+                var row5 = new ArrayList<String>();
+                row5.add(one.key());
+                row5.add("" + one.length());
+                rows5.add(row5);
+            }
+
+            var header5 = toHeaders("key", "length");
+            new TablePrinter(header5).print(rows5);
+        }
 
         return 0;
     }
