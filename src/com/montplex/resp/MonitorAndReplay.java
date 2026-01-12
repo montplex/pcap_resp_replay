@@ -11,10 +11,8 @@ import io.lettuce.core.codec.ByteArrayCodec;
 import io.lettuce.core.output.ByteArrayOutput;
 import io.lettuce.core.protocol.CommandArgs;
 import io.lettuce.core.protocol.CommandType;
-import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.vproxy.base.util.ByteArray;
-import io.vproxy.base.util.bytearray.SubByteArray;
 import io.vproxy.vpacket.EthernetPacket;
 import io.vproxy.vpacket.Ipv4Packet;
 import io.vproxy.vpacket.PacketDataBuffer;
@@ -29,10 +27,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import picocli.CommandLine;
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.exceptions.JedisConnectionException;
 import redis.clients.jedis.exceptions.JedisException;
 
-import java.sql.Timestamp;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -66,8 +66,8 @@ class MonitorAndReplay implements Callable<Integer> {
     @CommandLine.Option(names = {"-r", "--read-timeout"}, description = "read timeout seconds by capture from network interface, default: 10")
     int readTimeout = 10;
 
-    @CommandLine.Option(names = {"-b", "--buffer-size"}, description = "buffer size, default: 65536")
-    int bufferSize = 65536;
+    @CommandLine.Option(names = {"-b", "--buffer-size"}, description = "buffer size, default: 1048576 (1M)")
+    int bufferSize = 1048576;
 
     @CommandLine.Option(names = {"-f", "--filter"}, description = "filter, default: tcp dst port 6379")
     String filter = "tcp dst port 6379";
@@ -78,8 +78,8 @@ class MonitorAndReplay implements Callable<Integer> {
     @CommandLine.Option(names = {"-s", "--running-seconds"}, description = "running seconds, default: 60")
     int runningSeconds = 60;
 
-    @CommandLine.Option(names = {"-t", "--send-cmd-threads"}, description = "send cmd threads, default: 1")
-    int sendCmdThreads = 1;
+    @CommandLine.Option(names = {"-B", "--send-cmd-pipeline-batch-size"}, description = "send cmd pipeline size, default: 5")
+    int sendCmdPipelineBatchSize = 5;
 
     @CommandLine.Option(names = {"-m", "--big-key-top-num"}, description = "big key top num, default: 10")
     int bigKeyTopNum = 10;
@@ -91,9 +91,7 @@ class MonitorAndReplay implements Callable<Integer> {
 
     private final RESP resp = new RESP();
 
-    private ByteBuf buf;
-
-    private void handlePacket(Packet packet, Timestamp timestamp) {
+    private void handlePacket(Packet packet) throws IOException {
         var p = (UnknownPacket) packet;
 
         var byteArray = ByteArray.from(p.getRawData());
@@ -107,52 +105,41 @@ class MonitorAndReplay implements Callable<Integer> {
             return;
         }
 
-        if (!(byteArray2 instanceof SubByteArray subByteArray)) {
-            return;
-        }
+//        if (!(byteArray2 instanceof SubByteArray subByteArray)) {
+//            return;
+//        }
 
-        var rawBytes = subByteArray.toJavaArray();
+        var rawBytes = byteArray2.toJavaArray();
+        var buf = Unpooled.wrappedBuffer(rawBytes);
 
-        buf.readerIndex(0);
-        buf.writerIndex(0);
-        buf.writeBytes(rawBytes);
-
-        var data = resp.decode(buf);
-        while (data != null) {
-            for (var d : data) {
-                if (d == null) {
-                    // not received yet
-                    invalidRespDataCount++;
-                    break;
-                }
-            }
-
+        var cmdArgs = resp.decode(buf);
+        while (cmdArgs != null) {
             validRespDataCount++;
 
-            var cmd = new String(data[0]).toLowerCase();
+            var cmd = cmdArgs.cmd();
             var count = countByCmd.getOrDefault(cmd, 0L);
             countByCmd.put(cmd, count + 1);
             if (Category.isReadCmd(cmd)) {
                 readCmdCount++;
-                var n = forwardCommand(cmd, data, true);
+                var n = forwardCommand(cmdArgs, true);
                 forwardReadCount += n;
                 if (n != readScale) {
                     forwardReadErrorCount += (readScale - n);
                 }
             } else if (Category.isWriteCmd(cmd)) {
-                checkBigKey(cmd, data);
+                checkBigKey(cmdArgs);
 
                 writeCmdCount++;
-                var n = forwardCommand(cmd, data, false);
+                var n = forwardCommand(cmdArgs, false);
                 forwardWriteCount += n;
                 if (n != writeScale) {
                     forwardWriteErrorCount += (writeScale - n);
                 }
             } else {
-                log.debug("not read or write, cmd: {}", cmd);
+                log.debug("not read or write, cmdArgs: {}", cmd);
             }
 
-            data = resp.decode(buf);
+            cmdArgs = resp.decode(buf);
         }
 
         if (validRespDataCount % 1_00_000 == 0) {
@@ -161,20 +148,19 @@ class MonitorAndReplay implements Callable<Integer> {
         }
     }
 
-    private void checkBigKey(String cmd, byte[][] data) {
+    private void checkBigKey(CmdArgs cmdArgs) {
         // only support set
-        if (!cmd.equals("set") || data.length != 3) {
+        if (!cmdArgs.cmd().equals("SET") || cmdArgs.args().length != 2) {
             return;
         }
 
-        var key = new String(data[1]);
-        var valueLength = data[2].length;
+        var key = new String(cmdArgs.args()[0]);
+        var valueLength = cmdArgs.args()[1].length;
 
         bigKeyTopK.add(key, valueLength);
     }
 
     private long timeoutPacketGetCount = 0L;
-    private long invalidRespDataCount;
     private long validRespDataCount;
     private long readCmdCount = 0L;
     private long writeCmdCount = 0L;
@@ -187,19 +173,62 @@ class MonitorAndReplay implements Callable<Integer> {
     private final TreeMap<String, Long> countByCmd = new TreeMap<>();
     private BigKeyTopK bigKeyTopK;
 
-    private ExecutorService executor;
+    private FileWriter debugOutputFileWriter;
 
-    private int forwardCommand(String cmd, byte[][] data, boolean isRead) {
+    private static class PipelineExecutor {
+        private final int limit;
+        private final Jedis jedis;
+        private Pipeline pipeline;
+
+        private int count = 0;
+
+        private PipelineExecutor(int limit, Jedis jedis) {
+            this.limit = limit;
+            this.jedis = jedis;
+            this.pipeline = jedis.pipelined();
+        }
+
+        public void disconnect() {
+            if (jedis != null && jedis.isConnected()) {
+                try {
+                    jedis.disconnect();
+                } catch (Exception ignore) {
+
+                }
+            }
+        }
+
+        public void sendCommand(ExtendCommand extendCommand, byte[][] args) {
+            pipeline.sendCommand(extendCommand, args);
+            count++;
+            if (count == limit) {
+                pipeline.sync();
+                count = 0;
+                pipeline = jedis.pipelined();
+            }
+        }
+
+        public void flush() {
+            if (count > 0) {
+                pipeline.sync();
+            }
+        }
+    }
+
+    private int forwardCommand(CmdArgs cmdArgs, boolean isRead) throws IOException {
         if (isDebug) {
             var sb = new StringBuilder();
-            for (int i = 0; i < data.length; i++) {
-                var bytes = data[i];
+            sb.append(cmdArgs.cmd());
+            sb.append(" ");
+            for (int i = 0; i < cmdArgs.args().length; i++) {
+                var bytes = cmdArgs.args()[i];
                 sb.append(new String(bytes));
-                if (i != data.length - 1) {
+                if (i != cmdArgs.args().length - 1) {
                     sb.append(" ");
                 }
             }
-            log.info(sb.toString());
+            sb.append("\n");
+            debugOutputFileWriter.write(sb.toString());
             return isRead ? readScale : writeScale;
         }
 
@@ -209,7 +238,7 @@ class MonitorAndReplay implements Callable<Integer> {
             for (var connection : connections) {
                 var async = connection.async();
                 try {
-                    var future = executeCommand(async, cmd, data);
+                    var future = executeCommandByLettuce(async, cmdArgs);
                     if (future != null) {
                         n++;
                     }
@@ -219,50 +248,34 @@ class MonitorAndReplay implements Callable<Integer> {
             }
             return n;
         } else {
-            List<Jedis> list = isRead ? jedisReadList : jedisWriteList;
-            var args = new byte[data.length - 1][];
-            System.arraycopy(data, 1, args, 0, args.length);
+            List<PipelineExecutor> list = isRead ? jedisReadList : jedisWriteList;
             int n = 0;
-            for (var jedis : list) {
-                if (sendCmdThreads > 1) {
-                    executor.execute(() -> {
-                        try {
-                            jedis.sendCommand(new ExtendCommand(cmd), args);
-                        } catch (JedisException ignore) {
-                            // ok
-                        } catch (Exception e) {
-                            log.error("Failed to execute command, err: {}", e.getMessage());
-                        }
-                    });
+            for (var pipelineExecutor : list) {
+                try {
+                    pipelineExecutor.sendCommand(new ExtendCommand(cmdArgs.cmd()), cmdArgs.args());
                     n++;
-                } else {
-                    try {
-                        jedis.sendCommand(new ExtendCommand(cmd), args);
-                        n++;
-                    } catch (JedisException ignore) {
-                        // ok
-                    } catch (Exception e) {
-                        log.error("Failed to execute command, err: {}", e.getMessage());
-                    }
+                } catch (JedisException ignore) {
+                    // ok
+                } catch (Exception e) {
+                    log.error("Failed to execute command, err: {}", e.getMessage());
                 }
             }
             return n;
         }
     }
 
-    private RedisFuture<?> executeCommand(RedisAsyncCommands<byte[], byte[]> async, String cmd, byte[][] data) {
+    private RedisFuture<?> executeCommandByLettuce(RedisAsyncCommands<byte[], byte[]> async, CmdArgs cmdArgs) {
         CommandType commandType;
         try {
-            commandType = CommandType.valueOf(cmd.toUpperCase());
+            commandType = CommandType.valueOf(cmdArgs.cmd());
         } catch (Exception e) {
-            log.warn("Failed to get command type, cmd: {}", cmd);
+            log.warn("Failed to get command type, cmd: {}", cmdArgs.cmd());
             return null;
         }
 
         var commandArgs = new CommandArgs<>(ByteArrayCodec.INSTANCE);
-        for (int i = 1; i < data.length; i++) {
-            // data[i] is not null
-            commandArgs.add(data[i]);
+        for (var arg : cmdArgs.args()) {
+            commandArgs.add(arg);
         }
 
         return async.dispatch(commandType, new ByteArrayOutput<>(ByteArrayCodec.INSTANCE), commandArgs);
@@ -296,7 +309,7 @@ class MonitorAndReplay implements Callable<Integer> {
         log.info("runningSeconds: {}", runningSeconds);
         log.info("readScale: {}", readScale);
         log.info("writeScale: {}", writeScale);
-        log.info("sendCmdThreads: {}", sendCmdThreads);
+        log.info("sendCmdPipelineBatchSize: {}", sendCmdPipelineBatchSize);
         log.info("bigKeyTopNum: {}", bigKeyTopNum);
         log.info("isDebug: {}", isDebug);
 
@@ -306,14 +319,8 @@ class MonitorAndReplay implements Callable<Integer> {
             return 1;
         }
 
-        final int maxSendCmdThreads = getFromSystemProperty("maxSendCmdThreads", 4);
-        if (sendCmdThreads > maxSendCmdThreads) {
-            log.warn("send cmd threads is too large, max: {}", maxSendCmdThreads);
-            return 1;
-        }
-
-        if (sendCmdThreads > 1 && !isDebug) {
-            executor = Executors.newFixedThreadPool(sendCmdThreads);
+        if (isDebug) {
+            debugOutputFileWriter = new FileWriter("debug.txt", false);
         }
 
         final int maxReadScale = getFromSystemProperty("maxReadScale", 100);
@@ -338,8 +345,6 @@ class MonitorAndReplay implements Callable<Integer> {
         }
 
         initializeConnections();
-
-        buf = Unpooled.buffer(bufferSize);
 
         var nif = Pcaps.getDevByName(itf);
         if (nif == null) {
@@ -390,7 +395,7 @@ class MonitorAndReplay implements Callable<Integer> {
             }
 
             if (packet != null) {
-                handlePacket(packet, handle.getTimestamp());
+                handlePacket(packet);
                 num++;
                 if (num % 1_000_000 == 0) {
                     log.info("received packets: {}", num);
@@ -402,9 +407,11 @@ class MonitorAndReplay implements Callable<Integer> {
         }
 
         scheduler.shutdown();
-        if (executor != null) {
-            executor.shutdownNow();
+        if (debugOutputFileWriter != null) {
+            debugOutputFileWriter.close();
         }
+
+        flushPipelines();
 
         Thread.sleep(1000 * 5);
         closeConnections();
@@ -419,7 +426,7 @@ class MonitorAndReplay implements Callable<Integer> {
         new TablePrinter(headers).print(rows);
 
         // print read write cmd stats
-        var row2 = toRow(timeoutPacketGetCount, invalidRespDataCount, validRespDataCount,
+        var row2 = toRow(timeoutPacketGetCount, resp.invalidDecodeCount, validRespDataCount,
                 readCmdCount, writeCmdCount, validRespDataCount - readCmdCount - writeCmdCount);
         var rows2 = new ArrayList<List<String>>();
         rows2.add(row2);
@@ -485,8 +492,17 @@ class MonitorAndReplay implements Callable<Integer> {
     private final List<StatefulRedisConnection<byte[], byte[]>> readConnections = new ArrayList<>();
     private final List<StatefulRedisConnection<byte[], byte[]>> writeConnections = new ArrayList<>();
 
-    private final List<Jedis> jedisReadList = new ArrayList<>();
-    private final List<Jedis> jedisWriteList = new ArrayList<>();
+    private final List<PipelineExecutor> jedisReadList = new ArrayList<>();
+    private final List<PipelineExecutor> jedisWriteList = new ArrayList<>();
+
+    private void flushPipelines() {
+        for (var pipelineExecutor : jedisReadList) {
+            pipelineExecutor.flush();
+        }
+        for (var pipelineExecutor : jedisWriteList) {
+            pipelineExecutor.flush();
+        }
+    }
 
     private final boolean isUseLettuce = getFromSystemProperty("useLettuce", 0) == 1;
 
@@ -512,12 +528,12 @@ class MonitorAndReplay implements Callable<Integer> {
             log.info("use jedis");
             for (int i = 0; i < readScale; i++) {
                 var jedis = new Jedis(targetHost, targetPort);
-                jedisReadList.add(jedis);
+                jedisReadList.add(new PipelineExecutor(sendCmdPipelineBatchSize, jedis));
             }
 
             for (int i = 0; i < writeScale; i++) {
                 var jedis = new Jedis(targetHost, targetPort);
-                jedisWriteList.add(jedis);
+                jedisWriteList.add(new PipelineExecutor(sendCmdPipelineBatchSize, jedis));
             }
         }
 
@@ -543,24 +559,8 @@ class MonitorAndReplay implements Callable<Integer> {
             });
             redisClient.shutdown();
         } else {
-            jedisReadList.forEach(jedis -> {
-                if (jedis != null && jedis.isConnected()) {
-                    try {
-                        jedis.disconnect();
-                    } catch (Exception ignore) {
-
-                    }
-                }
-            });
-            jedisWriteList.forEach(jedis -> {
-                if (jedis != null && jedis.isConnected()) {
-                    try {
-                        jedis.disconnect();
-                    } catch (Exception ignore) {
-
-                    }
-                }
-            });
+            jedisReadList.forEach(PipelineExecutor::disconnect);
+            jedisWriteList.forEach(PipelineExecutor::disconnect);
         }
         log.info("read connections closed");
         log.info("write connections closed");

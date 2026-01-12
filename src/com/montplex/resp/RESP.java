@@ -71,7 +71,9 @@ public class RESP {
         return data;
     }
 
-    public byte[][] decode(ByteBuf bb) {
+    long invalidDecodeCount = 0L;
+
+    public CmdArgs decode(ByteBuf bb) {
         byte[][] bytes = null;
         outerLoop:
         while (true) {
@@ -122,6 +124,24 @@ public class RESP {
                 break;
             }
         }
-        return bytes;
+
+        if (bytes == null || bytes.length == 0) {
+            return null;
+        }
+        for (var b : bytes) {
+            if (b == null) {
+                invalidDecodeCount++;
+                return null;
+            }
+        }
+
+        // Convert the first byte array to command string (the command itself)
+        var cmd = new String(bytes[0]).toUpperCase();
+
+        // Convert remaining byte arrays to argument strings
+        var args = new byte[bytes.length - 1][];
+        System.arraycopy(bytes, 1, args, 0, bytes.length - 1);
+
+        return new CmdArgs(cmd, args);
     }
 }
