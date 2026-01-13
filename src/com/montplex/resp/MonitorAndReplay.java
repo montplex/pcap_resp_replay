@@ -57,10 +57,10 @@ class MonitorAndReplay implements Callable<Integer> {
     @CommandLine.Option(names = {"-P", "--target-port"}, description = "target port, eg: 6380")
     int targetPort = 6380;
 
-    @CommandLine.Option(names = {"-R", "--read-scale"}, description = "read scale, default: 1")
+    @CommandLine.Option(names = {"-R", "--read-scale"}, description = "read scale, default: 1, max 100")
     int readScale = 1;
 
-    @CommandLine.Option(names = {"-W", "--write-scale"}, description = "write scale, default: 1")
+    @CommandLine.Option(names = {"-W", "--write-scale"}, description = "write scale, default: 1, max 100")
     int writeScale = 1;
 
     @CommandLine.Option(names = {"-r", "--read-timeout"}, description = "read timeout seconds by capture from network interface, default: 10")
@@ -75,13 +75,13 @@ class MonitorAndReplay implements Callable<Integer> {
     @CommandLine.Option(names = {"-c", "--max-packet-count"}, description = "receive max packet count, default: -1, means not limit")
     long maxPacketCount = -1;
 
-    @CommandLine.Option(names = {"-s", "--running-seconds"}, description = "running seconds, default: 60")
+    @CommandLine.Option(names = {"-s", "--running-seconds"}, description = "running seconds, default: 60, max 36000")
     int runningSeconds = 60;
 
-    @CommandLine.Option(names = {"-B", "--send-cmd-pipeline-batch-size"}, description = "send cmd pipeline size, default: 5")
-    int sendCmdPipelineBatchSize = 5;
+    @CommandLine.Option(names = {"-B", "--send-cmd-batch-size"}, description = "send cmd pipeline size, default: 1, max 10, means no pipeline")
+    int sendCmdBatchSize = 1;
 
-    @CommandLine.Option(names = {"-m", "--big-key-top-num"}, description = "big key top num, default: 10")
+    @CommandLine.Option(names = {"-m", "--big-key-top-num"}, description = "big key top num, default: 10, max 100")
     int bigKeyTopNum = 10;
 
     @CommandLine.Option(names = {"-d", "--debug"}, description = "debug mode, if true, just log resp data, skip execute to target redis server")
@@ -176,16 +176,19 @@ class MonitorAndReplay implements Callable<Integer> {
     private FileWriter debugOutputFileWriter;
 
     private static class PipelineExecutor {
-        private final int limit;
+        private final int batchSize;
         private final Jedis jedis;
         private Pipeline pipeline;
 
         private int count = 0;
 
-        private PipelineExecutor(int limit, Jedis jedis) {
-            this.limit = limit;
+        private PipelineExecutor(int batchSize, Jedis jedis) {
+            this.batchSize = batchSize;
             this.jedis = jedis;
-            this.pipeline = jedis.pipelined();
+
+            if (batchSize > 1) {
+                this.pipeline = jedis.pipelined();
+            }
         }
 
         public void disconnect() {
@@ -199,9 +202,14 @@ class MonitorAndReplay implements Callable<Integer> {
         }
 
         public void sendCommand(ExtendCommand extendCommand, byte[][] args) {
+            if (batchSize == 1) {
+                jedis.sendCommand(extendCommand, args);
+                return;
+            }
+
             pipeline.sendCommand(extendCommand, args);
             count++;
-            if (count == limit) {
+            if (count == batchSize) {
                 pipeline.sync();
                 count = 0;
                 pipeline = jedis.pipelined();
@@ -309,7 +317,7 @@ class MonitorAndReplay implements Callable<Integer> {
         log.info("runningSeconds: {}", runningSeconds);
         log.info("readScale: {}", readScale);
         log.info("writeScale: {}", writeScale);
-        log.info("sendCmdPipelineBatchSize: {}", sendCmdPipelineBatchSize);
+        log.info("sendCmdBatchSize: {}", sendCmdBatchSize);
         log.info("bigKeyTopNum: {}", bigKeyTopNum);
         log.info("isDebug: {}", isDebug);
 
@@ -331,6 +339,18 @@ class MonitorAndReplay implements Callable<Integer> {
         final int maxWriteScale = getFromSystemProperty("maxWriteScale", 100);
         if (writeScale > maxWriteScale) {
             log.warn("write scale is too large, max: {}", maxWriteScale);
+            return 1;
+        }
+
+        final int maxSendCmdBatchSize = getFromSystemProperty("maxSendCmdBatchSize", 10);
+        if (sendCmdBatchSize > maxSendCmdBatchSize) {
+            log.warn("send cmd batch size is too large, max: {}", maxSendCmdBatchSize);
+            return 1;
+        }
+
+        final int maxBigKeyTopNum = getFromSystemProperty("maxBigKeyTopNum", 100);
+        if (bigKeyTopNum > maxBigKeyTopNum) {
+            log.warn("big key top num is too large, max: {}", maxBigKeyTopNum);
             return 1;
         }
 
@@ -411,7 +431,9 @@ class MonitorAndReplay implements Callable<Integer> {
             debugOutputFileWriter.close();
         }
 
-        flushPipelines();
+        if (sendCmdBatchSize > 1) {
+            flushPipelines();
+        }
 
         Thread.sleep(1000 * 5);
         closeConnections();
@@ -528,12 +550,12 @@ class MonitorAndReplay implements Callable<Integer> {
             log.info("use jedis");
             for (int i = 0; i < readScale; i++) {
                 var jedis = new Jedis(targetHost, targetPort);
-                jedisReadList.add(new PipelineExecutor(sendCmdPipelineBatchSize, jedis));
+                jedisReadList.add(new PipelineExecutor(sendCmdBatchSize, jedis));
             }
 
             for (int i = 0; i < writeScale; i++) {
                 var jedis = new Jedis(targetHost, targetPort);
-                jedisWriteList.add(new PipelineExecutor(sendCmdPipelineBatchSize, jedis));
+                jedisWriteList.add(new PipelineExecutor(sendCmdBatchSize, jedis));
             }
         }
 
