@@ -321,6 +321,11 @@ class MonitorAndReplay implements Callable<Integer> {
         log.info("bigKeyTopNum: {}", bigKeyTopNum);
         log.info("isDebug: {}", isDebug);
 
+        if (!filter.endsWith("" + port)) {
+            filter = "tcp dst port " + port;
+            log.warn("filter reset to {}", filter);
+        }
+
         final int maxRunningSeconds = getFromSystemProperty("maxRunningSeconds", 36000);
         if (runningSeconds > maxRunningSeconds) {
             log.warn("running seconds is too large, max: {}", maxRunningSeconds);
