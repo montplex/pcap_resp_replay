@@ -482,7 +482,7 @@ class MonitorAndReplay implements Callable<Integer> {
         // print big key top n
         var queue = bigKeyTopK.getQueue();
         if (!queue.isEmpty()) {
-            log.info("big key top n: {}", bigKeyTopNum);
+            System.out.println("big key top n: " + bigKeyTopNum);
             var rows5 = new ArrayList<List<String>>();
             for (var one : queue) {
                 var row5 = new ArrayList<String>();
