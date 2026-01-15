@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: target-redis-pod
+  labels:
+    app: redis-app
+spec:
+  containers:
+    - name: redis-container
+      image: docker.1ms.run/library/redis:7.2
+      ports:
+        - containerPort: 6379
+          name: redis-port
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: target-redis-service
+spec:
+  selector:
+    app: redis-app
+  ports:
+    - port: 6379
+      targetPort: 6379
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pcap-replay-pod
+  labels:
+    app: pcap-replay-app
+spec:
+  containers:
+    - name: redis-container
+      image: docker.1ms.run/library/redis:7.2
+      ports:
+        - containerPort: 6379
+          name: redis-port
+      readinessProbe:
+        exec:
+          command:
+            - redis-cli
+            - ping
+        initialDelaySeconds: 2
+        periodSeconds: 2
+      livenessProbe:
+        exec:
+          command:
+            - redis-cli
+            - ping
+        initialDelaySeconds: 2
+        periodSeconds: 2
+    - name: redis-benchmark-container
+      image: docker.1ms.run/library/redis:7.2
+      command:
+        - sh
+        - -c
+        - |
+          until redis-cli -h localhost ping; do
+            echo "Waiting for Redis to be ready..."
+            sleep 2
+          done
+          sleep 5
+          redis-benchmark -c 1 -r 1000000 -n 1000000 -t get,set
+    - name: pcap-replay-container
+      image: montplex/pcap_resp_replay:1.0.0
+      args:
+        - -i
+        - lo
+        - -H
+        - target-redis-service
+        - -P
+        - "6379"
+        - -s
+        - "60"
+      resources:
+        requests:
+          memory: "1024Mi"
+          cpu: "1000m"
+        limits:
+          memory: "1024Mi"
+          cpu: "1000m"
