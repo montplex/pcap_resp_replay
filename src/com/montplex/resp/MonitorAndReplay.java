@@ -374,6 +374,10 @@ class MonitorAndReplay implements Callable<Integer> {
         var nif = Pcaps.getDevByName(itf);
         if (nif == null) {
             log.warn("No such device: {}", itf);
+            var allDevs = Pcaps.findAllDevs();
+            for (var dev : allDevs) {
+                log.info("Find dev: {}, address: {}", dev.getName(), dev.getAddresses());
+            }
             return 1;
         }
         log.info("get nif: {}, description: {}", nif.getName(), nif.getDescription());
@@ -390,7 +394,6 @@ class MonitorAndReplay implements Callable<Integer> {
                 } catch (InterruptedException ignore) {
                 }
             }
-            jedisSourceServer.close();
         }, runningSeconds, TimeUnit.SECONDS);
 
         var isLocalDebug = System.getProperty("localDebug") != null;
@@ -441,6 +444,16 @@ class MonitorAndReplay implements Callable<Integer> {
         }
 
         Thread.sleep(1000 * 5);
+
+        var dbSizeSource = jedisSourceServer.dbSize();
+        log.info("db size source: {}", dbSizeSource);
+        jedisSourceServer.close();
+
+        var jedisTargetServer = new Jedis(targetHost, targetPort);
+        var dbSizeTarget = jedisTargetServer.dbSize();
+        log.info("db size target: {}", dbSizeTarget);
+        jedisTargetServer.close();
+
         closeConnections();
 
         // print package stats
