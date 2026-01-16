@@ -60,6 +60,13 @@ public class ToKafkaSender {
 
     public void close() {
         if (isKafkaMock) {
+            if (mockRecordsOs != null) {
+                try {
+                    mockRecordsOs.close();
+                } catch (Exception e) {
+                    log.error("Error closing mock records file: {}", e.getMessage());
+                }
+            }
             return;
         }
 

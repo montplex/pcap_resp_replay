@@ -211,6 +211,8 @@ public class FromKafkaConsumer {
                         break;
                     }
                 }
+
+                mockRecordsIs.close();
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
