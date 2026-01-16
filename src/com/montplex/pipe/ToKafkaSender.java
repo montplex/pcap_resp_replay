@@ -1,13 +1,18 @@
 package com.montplex.pipe;
 
+import com.montplex.resp.MonitorAndReplay;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.util.Properties;
 
 public class ToKafkaSender {
@@ -21,7 +26,16 @@ public class ToKafkaSender {
         this.broker = broker;
     }
 
+    private final boolean isKafkaMock = MonitorAndReplay.getFromSystemProperty("isKafkaMock", 0) == 1;
+
+    private final File mockRecordsFile = new File("mock_records.dat");
+
     public boolean connect() {
+        if (isKafkaMock) {
+            log.warn("is kafka mock mode");
+            return true;
+        }
+
         try {
             var props = new Properties();
             props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, broker);
@@ -45,6 +59,10 @@ public class ToKafkaSender {
     }
 
     public void close() {
+        if (isKafkaMock) {
+            return;
+        }
+
         try {
             producer.close();
             log.info("Kafka producer closed successfully");
@@ -53,8 +71,50 @@ public class ToKafkaSender {
         }
     }
 
-    public void send(byte[] data) {
-        var record = new ProducerRecord<String, byte[]>(topic, data);
+    private static final byte[] BYTES_TRUE = new byte[]{1};
+
+    private static final RecordHeaders REQUEST_HEADERS;
+
+    static {
+        REQUEST_HEADERS = new RecordHeaders();
+        REQUEST_HEADERS.add("isRequest", BYTES_TRUE);
+    }
+
+    private long sendCount = 0L;
+
+    private DataOutputStream mockRecordsOs;
+
+    public void send(byte[] data, boolean isRequest, long millis) {
+        if (isKafkaMock) {
+            if (mockRecordsOs == null) {
+                try {
+                    mockRecordsOs = new DataOutputStream(new FileOutputStream(mockRecordsFile, true));
+                } catch (Exception e) {
+                    log.error("Error opening mock records file: {}", e.getMessage());
+                }
+            }
+            try {
+                var header = millis + " " + (isRequest ? "REQ" : "RESP");
+                mockRecordsOs.writeInt(header.length());
+                mockRecordsOs.write(header.getBytes());
+                mockRecordsOs.writeInt(data.length);
+                mockRecordsOs.write(data);
+                mockRecordsOs.flush();
+
+                sendCount++;
+                if (sendCount % 100000 == 0) {
+                    log.info("sendCount: {}", sendCount);
+                }
+            } catch (Exception e) {
+                log.error("Error writing mock records: {}", e.getMessage());
+            }
+
+
+            return;
+        }
+
+        // timestamp is in milliseconds
+        var record = new ProducerRecord<String, byte[]>(topic, null, millis, null, data, isRequest ? REQUEST_HEADERS : null);
         try {
             producer.send(record, (metadata, exception) -> {
                 if (exception != null) {
@@ -64,12 +124,21 @@ public class ToKafkaSender {
                             metadata.topic(), metadata.partition(), metadata.offset());
                 }
             });
+
+            sendCount++;
+            if (sendCount % 100000 == 0) {
+                log.info("sendCount: {}", sendCount);
+            }
         } catch (Exception e) {
             log.error("Error sending message to Kafka: {}", e.getMessage());
         }
     }
 
     public void flush() {
+        if (isKafkaMock) {
+            return;
+        }
+
         producer.flush();
     }
 }

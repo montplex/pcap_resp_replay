@@ -7,8 +7,15 @@ import io.netty.util.CharsetUtil;
 // reuse decode by netty ByteBuf, copy from camellia-redis-proxy com.netease.nim.camellia.redis.proxy.netty.CommandDecoder
 public class RESP {
     private static final byte STRING_MARKER = '+';
+    private static final byte ERROR_MARKER = '-';
+    private static final byte INTEGER_MARKER = ':';
     private static final byte BYTES_MARKER = '$';
     private static final byte ARRAY_MARKER = '*';
+    private static final byte BOOLEAN_MARKER = '#';
+    private static final byte NULL_MARKER = '_';
+    private static final byte DOUBLE_MARKER = ',';
+    private static final byte MAP_MARKER = '%';
+    private static final byte SET_MARKER = '~';
 
     private static final int POSITIVE_LONG_MAX_LENGTH = 19; // length of Long.MAX_VALUE
     private static final int EOL_LENGTH = 2;
@@ -73,7 +80,22 @@ public class RESP {
 
     long invalidDecodeCount = 0L;
 
-    public CmdArgs decode(ByteBuf bb) {
+    public interface ClientDataCallback {
+        void onData(long millis, Object one, Object[] array);
+    }
+
+    public static CmdArgs RESPONSE_CMD = new CmdArgs(null, null);
+
+    public CmdArgs decode(ByteBuf bb, ClientDataCallback callback) {
+        return decode(bb, false, 0, callback);
+    }
+
+    public CmdArgs decode(ByteBuf bb, boolean isRequest) {
+        return decode(bb, isRequest, 0, null);
+    }
+
+    public CmdArgs decode(ByteBuf bb, boolean isRequest, long millis, ClientDataCallback callback) {
+        int beforeReadIndex = bb.readerIndex();
         byte[][] bytes = null;
         outerLoop:
         while (true) {
@@ -83,7 +105,7 @@ public class RESP {
                 }
                 int readerIndex = bb.readerIndex();
                 byte b = bb.readByte();
-                if (b == STRING_MARKER || b == ARRAY_MARKER) {
+                if (b == ARRAY_MARKER) {
                     var lineBuf = readLine(bb);
                     if (lineBuf == null) {
                         bb.readerIndex(readerIndex);
@@ -91,6 +113,19 @@ public class RESP {
                     }
                     int number = parseRedisNumber(lineBuf);
                     bytes = new byte[number][];
+                } else if (b == INTEGER_MARKER || b == BOOLEAN_MARKER || b == DOUBLE_MARKER
+                        || b == ERROR_MARKER || b == NULL_MARKER || b == STRING_MARKER || b == BYTES_MARKER
+                        || b == MAP_MARKER || b == SET_MARKER) {
+                    bb.readerIndex(readerIndex);
+                    var any = decodeAny(bb);
+                    if (callback != null) {
+                        if (any instanceof Object[] array) {
+                            callback.onData(millis, null, array);
+                        } else {
+                            callback.onData(millis, any, null);
+                        }
+                    }
+                    return RESPONSE_CMD;
                 } else {
                     throw new IllegalArgumentException("Unexpected character=" + b);
                 }
@@ -102,6 +137,16 @@ public class RESP {
                     }
                     int readerIndex = bb.readerIndex();
                     byte b = bb.readByte();
+                    // nested array.
+                    if (b == ARRAY_MARKER) {
+                        bb.readerIndex(beforeReadIndex);
+                        var array = decodeArray(bb);
+                        if (callback != null) {
+                            callback.onData(millis, null, array);
+                        }
+                        return RESPONSE_CMD;
+                    }
+
                     if (b == BYTES_MARKER) {
                         var lineBuf = readLine(bb);
                         if (lineBuf == null) {
@@ -109,6 +154,10 @@ public class RESP {
                             break outerLoop;
                         }
                         int size = parseRedisNumber(lineBuf);
+                        if (size == -1) { // Null bulk string
+                            bytes[i] = null;
+                            continue;
+                        }
                         if (bb.readableBytes() >= size + 2) {
                             bytes[i] = new byte[size];
                             bb.readBytes(bytes[i]);
@@ -135,6 +184,13 @@ public class RESP {
             }
         }
 
+        if (!isRequest) {
+            if (callback != null) {
+                callback.onData(millis, null, bytes);
+            }
+            return RESPONSE_CMD;
+        }
+
         // Convert the first byte array to command string (the command itself)
         var cmd = new String(bytes[0]).toUpperCase();
 
@@ -143,5 +199,152 @@ public class RESP {
         System.arraycopy(bytes, 1, args, 0, bytes.length - 1);
 
         return new CmdArgs(cmd, args);
+    }
+
+    // New method to decode any RESP type (not just commands)
+    public Object decodeAny(ByteBuf bb) {
+        if (!bb.isReadable()) {
+            return null;
+        }
+
+        int readerIndex = bb.readerIndex();
+        byte b = bb.getByte(readerIndex);
+
+        return switch (b) {
+            case STRING_MARKER -> decodeSimpleString(bb);
+            case ERROR_MARKER -> decodeError(bb);
+            case INTEGER_MARKER -> decodeInteger(bb);
+            case BYTES_MARKER -> decodeBulkString(bb);
+            case ARRAY_MARKER -> decodeArray(bb);
+            case BOOLEAN_MARKER -> decodeBoolean(bb);
+            case NULL_MARKER -> decodeNull(bb);
+            case DOUBLE_MARKER -> decodeDouble(bb);
+            case MAP_MARKER -> decodeMap(bb);
+            case SET_MARKER -> decodeSet(bb);
+            default -> throw new IllegalArgumentException("Unknown RESP type: " + (char) b);
+        };
+    }
+
+    private String decodeSimpleString(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        if (line != null) {
+            return line.toString(CharsetUtil.UTF_8);
+        }
+        return null;
+    }
+
+    private String decodeError(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        if (line != null) {
+            return line.toString(CharsetUtil.UTF_8);
+        }
+        return null;
+    }
+
+    private Long decodeInteger(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        if (line != null) {
+            return (long) parseRedisNumber(line);
+        }
+        return null;
+    }
+
+    private byte[] decodeBulkString(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        if (line != null) {
+            int size = parseRedisNumber(line);
+            if (size == -1) { // null bulk string
+                return "null".getBytes();
+            }
+            if (bb.readableBytes() >= size + 2) { // +2 for \r\n
+                var data = new byte[size];
+                bb.readBytes(data);
+                bb.skipBytes(2); // skip \r\n
+                return data;
+            }
+        }
+        return null;
+    }
+
+    private Object[] decodeArray(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        if (line != null) {
+            int size = parseRedisNumber(line);
+            if (size == -1) { // null array
+                return null;
+            }
+
+            var array = new Object[size];
+            for (int i = 0; i < size; i++) {
+                array[i] = decodeAny(bb);
+            }
+            return array;
+        }
+        return null;
+    }
+
+    private Boolean decodeBoolean(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        if (line != null) {
+            var value = line.toString(CharsetUtil.UTF_8);
+            if ("t".equals(value)) {
+                return true;
+            } else if ("f".equals(value)) {
+                return false;
+            }
+        }
+        return null;
+    }
+
+    private Object decodeNull(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        // Should be followed by \r\n indicating null
+        return "null";
+    }
+
+    private Double decodeDouble(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        if (line != null) {
+            var value = line.toString(CharsetUtil.UTF_8);
+            return Double.parseDouble(value);
+        }
+        return null;
+    }
+
+    private Object decodeMap(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        if (line != null) {
+            int size = parseRedisNumber(line);
+            // For simplicity, returning as array alternating key/value pairs
+            var map = new Object[size * 2];
+            for (int i = 0; i < size * 2; i++) {
+                map[i] = decodeAny(bb);
+            }
+            return map;
+        }
+        return null;
+    }
+
+    private Object[] decodeSet(ByteBuf bb) {
+        bb.readByte(); // skip marker
+        var line = readLine(bb);
+        if (line != null) {
+            int size = parseRedisNumber(line);
+            var set = new Object[size];
+            for (int i = 0; i < size; i++) {
+                set[i] = decodeAny(bb);
+            }
+            return set;
+        }
+        return null;
     }
 }

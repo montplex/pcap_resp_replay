@@ -1,5 +1,6 @@
 package com.montplex.resp;
 
+import com.montplex.consume.FromKafkaConsumer;
 import com.montplex.monitor.BigKeyTopK;
 import com.montplex.pipe.ToKafkaSender;
 import com.montplex.replay.ToRedisReplayer;
@@ -29,18 +30,30 @@ import java.util.concurrent.*;
 
 @CommandLine.Command(name = "java -jar pcap_resp_replay-1.0.0.jar", version = "1.0.0",
         description = "TCP monitor / filter and then replay / redirect to target redis server or kafka.")
-class MonitorAndReplay implements Callable<Integer> {
+public class MonitorAndReplay implements Callable<Integer> {
     @CommandLine.Option(names = {"-i", "--interface"}, description = "interface, eg: lo, default: lo")
     String itf = "lo";
 
-    @CommandLine.Option(names = {"-D", "--pipe-dump"}, description = "pipe dump, default: false")
+    @CommandLine.Option(names = {"-D", "--pipe-dump"}, description = "pipe dump to kafka, default: false")
     boolean isPipeDump = false;
+
+    @CommandLine.Option(names = {"-C", "--pipe-consumer"}, description = "pipe consumer from kafka, default: false")
+    boolean isPipeConsumer = false;
 
     @CommandLine.Option(names = {"-t", "--kafka-topic"}, description = "kafka topic, default: pcap_resp_replay")
     String kafkaTopic = "pcap_resp_replay";
 
     @CommandLine.Option(names = {"-k", "--kafka-broker"}, description = "kafka broker, eg: localhost:9092")
     String kafkaBroker = "localhost:9092";
+
+    @CommandLine.Option(names = {"-g", "--kafka-group-id"}, description = "pipe consumer from kafka group id, default: pcap_resp_replay")
+    String kafkaGroupId = "pcap_resp_replay";
+
+    @CommandLine.Option(names = {"-o", "--offset-from-time"}, description = "offset from time, eg: 2021-01-01 00:00:00")
+    String offsetFromTime = null;
+
+    @CommandLine.Option(names = {"-n", "--pipe-consume-max-num"}, description = "pipe consume max num, default: 10000")
+    int consumeMaxNum = 10000;
 
     private ToKafkaSender sender;
 
@@ -99,12 +112,24 @@ class MonitorAndReplay implements Callable<Integer> {
         var ethPacket = new EthernetPacket();
         ethPacket.from(new PacketDataBuffer(byteArray));
 
-        var tcpPacket = (TcpPacket) ((Ipv4Packet) ethPacket.getPacket()).getPacket();
+        var ipPacket = (Ipv4Packet) ethPacket.getPacket();
+        var tcpPacket = (TcpPacket) ipPacket.getPacket();
         var byteArray2 = tcpPacket.getData();
         if (byteArray2.length() == 0) {
             // skip empty packet
             return;
         }
+
+        // 获取源地址和目标地址信息
+        var srcHost = ipPacket.getSrc().getHostName();
+        var dstHost = ipPacket.getDst().getHostName();
+        var srcPort = tcpPacket.getSrcPort();
+        var dstPort = tcpPacket.getDstPort();
+
+        // 根据当前过滤规则判断方向
+        // 如果过滤器是 "tcp dst port 6379"，则目标端口为6379的是Redis请求
+        var isRequest = dstPort == port; // 请求到目标Redis服务器
+        var isResponse = srcPort == port; // 响应从目标Redis服务器返回
 
 //        if (!(byteArray2 instanceof SubByteArray subByteArray)) {
 //            return;
@@ -113,12 +138,12 @@ class MonitorAndReplay implements Callable<Integer> {
         var rawBytes = byteArray2.toJavaArray();
 
         if (isPipeDump) {
-            sender.send(rawBytes);
+            sender.send(rawBytes, isRequest, System.currentTimeMillis());
             return;
         }
 
         var buf = Unpooled.wrappedBuffer(rawBytes);
-        var cmdArgs = resp.decode(buf);
+        var cmdArgs = resp.decode(buf, isRequest);
         while (cmdArgs != null) {
             validRespDataCount++;
 
@@ -145,7 +170,7 @@ class MonitorAndReplay implements Callable<Integer> {
                 log.debug("not read or write, cmdArgs: {}", cmd);
             }
 
-            cmdArgs = resp.decode(buf);
+            cmdArgs = resp.decode(buf, isRequest);
         }
 
         if (validRespDataCount % 1_00_000 == 0) {
@@ -187,7 +212,7 @@ class MonitorAndReplay implements Callable<Integer> {
 
     private Jedis jedisSourceServer;
 
-    private int getFromSystemProperty(String key, int defaultValue) {
+    public static int getFromSystemProperty(String key, int defaultValue) {
         var value = System.getProperty(key);
         if (value == null) {
             return defaultValue;
@@ -197,6 +222,21 @@ class MonitorAndReplay implements Callable<Integer> {
 
     @Override
     public Integer call() throws Exception {
+        if (isPipeConsumer) {
+            var consumer = new FromKafkaConsumer(kafkaTopic, kafkaBroker, kafkaGroupId, offsetFromTime);
+            var isConnected = consumer.connect();
+            if (!isConnected) {
+                log.warn("failed to connect to kafka, please check kafka broker and topic");
+                return 1;
+            } else {
+                log.info("kafka consumer connect");
+            }
+            consumer.consume(consumeMaxNum);
+            consumer.close();
+            consumer.printStats();
+            return 0;
+        }
+
         log.info("interface: {}", itf);
         log.info("isPipeDump: {}", isPipeDump);
         if (isPipeDump) {
@@ -223,6 +263,11 @@ class MonitorAndReplay implements Callable<Integer> {
             filter = "tcp dst port " + port;
             log.warn("filter reset to {}", filter);
         }
+        // when pipe dump, may change to 'tcp port 6379', not only dst
+        if (isPipeDump && filter.contains("dst")) {
+            filter = filter.replace("dst ", "");
+            log.warn("filter reset to {}", filter);
+        }
 
         final int maxRunningSeconds = getFromSystemProperty("maxRunningSeconds", 36000);
         if (runningSeconds > maxRunningSeconds) {
@@ -240,6 +285,8 @@ class MonitorAndReplay implements Callable<Integer> {
             if (!isConnected) {
                 log.warn("failed to connect to kafka, please check kafka broker and topic");
                 return 1;
+            } else {
+                log.info("kafka sender connect");
             }
         } else {
             final int maxReadScale = getFromSystemProperty("maxReadScale", 100);
@@ -364,7 +411,7 @@ class MonitorAndReplay implements Callable<Integer> {
 
         if (replayer != null) {
             replayer.flushPipelines();
-            Thread.sleep(1000 * 5);
+            Thread.sleep(1000);
 
             var dbSizeTarget = replayer.dbSize();
             log.info("db size target: {}", dbSizeTarget);
@@ -401,6 +448,22 @@ class MonitorAndReplay implements Callable<Integer> {
 
     }
 
+    public static void printCmdCountStats(TreeMap<String, Long> countByCmd) {
+        // print cmd count
+        var rows = new ArrayList<List<String>>();
+        for (var entry : countByCmd.entrySet()) {
+            var cmd = entry.getKey();
+            var count = entry.getValue();
+            var row = new ArrayList<String>();
+            row.add(cmd);
+            row.add("" + count);
+            rows.add(row);
+        }
+
+        var header = toHeaders("cmd", "count");
+        new TablePrinter(header).print(rows);
+    }
+
     private void printReplayToTargetRedisStats() {
         // print read write cmd stats
         var row2 = toRow(timeoutPacketGetCount, resp.invalidDecodeCount, validRespDataCount,
@@ -421,18 +484,7 @@ class MonitorAndReplay implements Callable<Integer> {
         new TablePrinter(headers3).print(rows3);
 
         // print cmd count
-        var rows4 = new ArrayList<List<String>>();
-        for (var entry : countByCmd.entrySet()) {
-            var cmd = entry.getKey();
-            var count = entry.getValue();
-            var row4 = new ArrayList<String>();
-            row4.add(cmd);
-            row4.add("" + count);
-            rows4.add(row4);
-        }
-
-        var header4 = toHeaders("cmd", "count");
-        new TablePrinter(header4).print(rows4);
+        printCmdCountStats(countByCmd);
 
         // print big key top n
         var queue = bigKeyTopK.getQueue();
@@ -451,7 +503,7 @@ class MonitorAndReplay implements Callable<Integer> {
         }
     }
 
-    private List<String> toRow(long... value) {
+    public static List<String> toRow(long... value) {
         var row = new ArrayList<String>();
         for (long v : value) {
             row.add("" + v);
@@ -459,7 +511,7 @@ class MonitorAndReplay implements Callable<Integer> {
         return row;
     }
 
-    private List<String> toHeaders(String... value) {
+    public static List<String> toHeaders(String... value) {
         return Arrays.asList(value);
     }
 

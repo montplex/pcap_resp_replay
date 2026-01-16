@@ -56,7 +56,7 @@ public class RandomSetGet {
 
     public static void main(String[] args) {
         var runningSeconds = 10;
-        var executePerSecond = 10000;
+        var executePerSecond = 20000;
 
         final String host = "127.0.0.1";
         final int port = 6379;
