@@ -1,6 +1,7 @@
 package com.montplex.consume;
 
 import com.montplex.resp.Category;
+import com.montplex.resp.CmdArgs;
 import com.montplex.resp.MonitorAndReplay;
 import com.montplex.resp.RESP;
 import com.montplex.tools.TablePrinter;
@@ -94,6 +95,20 @@ public class FromKafkaConsumer {
     private static long lastPrintMillis = 0L;
 
     private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+
+    private void printCmdArgs(CmdArgs cmdArgs) {
+        var sb = new StringBuilder();
+        sb.append(cmdArgs.cmd());
+        sb.append(" ");
+        for (int i = 0; i < cmdArgs.args().length; i++) {
+            sb.append(new String(cmdArgs.args()[i]));
+            if (i < cmdArgs.args().length - 1) {
+                sb.append(" ");
+            }
+        }
+        sb.append("\n");
+        System.out.print(sb);
+    }
 
     private void printAny(long millis, Object any, Object[] array) {
         // print time every 10 seconds
@@ -273,6 +288,8 @@ public class FromKafkaConsumer {
                 } else {
                     otherCmdCount++;
                 }
+
+                printCmdArgs(cmdArgs);
             }
 
             cmdArgs = resp.decode(buf, isRequest, timestamp, this::printAny);
