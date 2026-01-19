@@ -99,6 +99,7 @@ public class SplitFileAppender {
                 }
             } else {
                 log.warn("Use existing file: {}", lastFile.getName());
+                fileSize = lastFile.length();
             }
 
             currentFile = lastFile;
