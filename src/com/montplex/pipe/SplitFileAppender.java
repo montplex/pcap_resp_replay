@@ -50,7 +50,7 @@ public class SplitFileAppender {
      * Initializes the file appender by finding or creating a file to write to
      * Sets up shutdown hook to properly close streams on application exit
      */
-    public void initWhenFirstTimeUse() {
+    public void initWhenFirstTimeUse(long beginMillis) {
         if (currentFile != null) {
             return;
         }
@@ -65,7 +65,11 @@ public class SplitFileAppender {
             if (files != null) {
                 for (File file : files) {
                     if (file.getName().startsWith(fileNamePrefix)) {
-                        String[] arr = file.getName().split("\\.");
+                        if (file.length() == 0) {
+                            continue;
+                        }
+
+                        var arr = file.getName().split("\\.");
                         if (arr.length == 5) {
                             long threadId = Long.parseLong(arr[3]);
                             // Need match thread ID when server restarts
@@ -74,6 +78,10 @@ public class SplitFileAppender {
                             }
 
                             long time = Long.parseLong(arr[1]);
+                            if (beginMillis != 0 && time > beginMillis) {
+                                continue;
+                            }
+
                             if (time > lastFileMillis) {
                                 lastFile = file;
                                 lastFileMillis = time;

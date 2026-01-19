@@ -1,6 +1,7 @@
 package com.montplex.resp;
 
 import com.montplex.consume.FromKafkaConsumer;
+import com.montplex.consume.FromLocalFileConsumer;
 import com.montplex.monitor.BigKeyTopK;
 import com.montplex.pipe.SplitFileAppender;
 import com.montplex.pipe.ToKafkaSender;
@@ -36,6 +37,9 @@ public class MonitorAndReplay implements Callable<Integer> {
 
     @CommandLine.Option(names = {"-D", "--pipe-dump"}, description = "pipe dump to kafka, default: false")
     boolean isPipeDump = false;
+
+    @CommandLine.Option(names = {"-L", "--pipe-dump-local"}, description = "pipe dump to local file, default: false")
+    boolean isPipeDumpLocal = false;
 
     @CommandLine.Option(names = {"-C", "--pipe-consumer"}, description = "pipe consumer from kafka, default: false")
     boolean isPipeConsumer = false;
@@ -84,9 +88,6 @@ public class MonitorAndReplay implements Callable<Integer> {
     @CommandLine.Option(names = {"-m", "--big-key-top-num"}, description = "big key top num, default: 10, max 100")
     int bigKeyTopNum = 10;
 
-    @CommandLine.Option(names = {"-d", "--debug"}, description = "debug mode, if true, just log resp data, skip execute to target redis server")
-    boolean isDebug = false;
-
     private ToRedisReplayer replayer;
 
     @CommandLine.Option(names = {"-b", "--buffer-size"}, description = "buffer size, default: 1048576 (1M)")
@@ -105,7 +106,25 @@ public class MonitorAndReplay implements Callable<Integer> {
 
     private final RESP resp = new RESP();
 
+    private String humanReadableSize(long size) {
+        if (size < 1024) {
+            return size + "B";
+        } else if (size < 1024 * 1024) {
+            return String.format("%.2fK", size / 1024.0);
+        } else if (size < 1024 * 1024 * 1024) {
+            return String.format("%.2fM", size / 1024.0 / 1024.0);
+        } else {
+            return String.format("%.2fG", size / 1024.0 / 1024.0 / 1024.0);
+        }
+    }
+
+    private long beginHandlePacketTime;
+
+    private long handledPacketCount = 0L;
+
     private void handlePacket(Packet packet) throws IOException {
+        handledPacketCount++;
+
         var p = (UnknownPacket) packet;
 
         var byteArray = ByteArray.from(p.getRawData());
@@ -138,7 +157,25 @@ public class MonitorAndReplay implements Callable<Integer> {
         var rawBytes = byteArray2.toJavaArray();
 
         if (isPipeDump) {
-            sender.send(rawBytes, isRequest, System.currentTimeMillis());
+            if (isPipeDumpLocal) {
+                appender.writeLong(System.currentTimeMillis());
+                appender.writeInt(isRequest ? 0 : 1);
+                appender.writeInt(rawBytes.length);
+                appender.writeBytes(rawBytes);
+                appender.checkIfNeedSplitFile();
+
+                if (handledPacketCount % 1_000_000 == 0) {
+                    var fileSize = appender.getFileSize();
+                    var costTime = System.currentTimeMillis() - beginHandlePacketTime;
+                    log.info("handled packet count: {}, file size: {}, cost time: {} s", handledPacketCount, humanReadableSize(fileSize), costTime / 1000);
+                }
+            } else {
+                sender.send(rawBytes, isRequest, System.currentTimeMillis());
+                if (handledPacketCount % 1_000_000 == 0) {
+                    var costTime = System.currentTimeMillis() - beginHandlePacketTime;
+                    log.info("handled packet count: {}, cost time: {} s", handledPacketCount, costTime / 1000);
+                }
+            }
             return;
         }
 
@@ -223,17 +260,29 @@ public class MonitorAndReplay implements Callable<Integer> {
     @Override
     public Integer call() throws Exception {
         if (isPipeConsumer) {
-            var consumer = new FromKafkaConsumer(kafkaTopic, kafkaBroker, kafkaGroupId, offsetFromTime);
-            var isConnected = consumer.connect();
-            if (!isConnected) {
-                log.warn("failed to connect to kafka, please check kafka broker and topic");
-                return 1;
+            log.info("is pipe consumer");
+            if (isPipeDumpLocal) {
+                log.info("is pipe dump local from file");
+                var consumer = new FromLocalFileConsumer();
+                consumer.setOffsetFromTime(offsetFromTime);
+                consumer.consume(consumeMaxNum);
+                consumer.close();
+                consumer.printStats();
             } else {
-                log.info("kafka consumer connect");
+                log.info("is pipe dump from kafka");
+                var consumer = new FromKafkaConsumer(kafkaTopic, kafkaBroker, kafkaGroupId);
+                consumer.setOffsetFromTime(offsetFromTime);
+                var isConnected = consumer.connect();
+                if (!isConnected) {
+                    log.warn("failed to connect to kafka, please check kafka broker and topic");
+                    return 1;
+                } else {
+                    log.info("kafka consumer connect");
+                }
+                consumer.consume(consumeMaxNum);
+                consumer.close();
+                consumer.printStats();
             }
-            consumer.consume(consumeMaxNum);
-            consumer.close();
-            consumer.printStats();
             return 0;
         }
 
@@ -257,7 +306,6 @@ public class MonitorAndReplay implements Callable<Integer> {
         log.info("maxPacketCount: {}", maxPacketCount);
         log.info("runningSeconds: {}", runningSeconds);
         log.info("bigKeyTopNum: {}", bigKeyTopNum);
-        log.info("isDebug: {}", isDebug);
 
         if (!filter.endsWith("" + port)) {
             filter = "tcp dst port " + port;
@@ -275,19 +323,19 @@ public class MonitorAndReplay implements Callable<Integer> {
             return 1;
         }
 
-        if (isDebug) {
-            appender = new SplitFileAppender(512 * 1024 * 1024);
-            appender.initWhenFirstTimeUse();
-        }
-
         if (isPipeDump) {
-            sender = new ToKafkaSender(kafkaTopic, kafkaBroker);
-            var isConnected = sender.connect();
-            if (!isConnected) {
-                log.warn("failed to connect to kafka, please check kafka broker and topic");
-                return 1;
+            if (isPipeDumpLocal) {
+                appender = new SplitFileAppender(512 * 1024 * 1024);
+                appender.initWhenFirstTimeUse(0L);
             } else {
-                log.info("kafka sender connect");
+                sender = new ToKafkaSender(kafkaTopic, kafkaBroker);
+                var isConnected = sender.connect();
+                if (!isConnected) {
+                    log.warn("failed to connect to kafka, please check kafka broker and topic");
+                    return 1;
+                } else {
+                    log.info("kafka sender connect");
+                }
             }
         } else {
             final int maxReadScale = getFromSystemProperty("maxReadScale", 100);
@@ -314,7 +362,7 @@ public class MonitorAndReplay implements Callable<Integer> {
             }
 
             bigKeyTopK = new BigKeyTopK(bigKeyTopNum);
-            replayer = new ToRedisReplayer(targetHost, targetPort, readScale, writeScale, sendCmdBatchSize, isUseLettuce, isDebug, appender);
+            replayer = new ToRedisReplayer(targetHost, targetPort, readScale, writeScale, sendCmdBatchSize, isUseLettuce, appender);
             replayer.initializeConnections();
         }
 
@@ -374,7 +422,7 @@ public class MonitorAndReplay implements Callable<Integer> {
             }
         }, 10, 30, TimeUnit.SECONDS);
 
-        long num = 0;
+        beginHandlePacketTime = System.currentTimeMillis();
         while (!stop) {
             Packet packet;
             try {
@@ -387,11 +435,7 @@ public class MonitorAndReplay implements Callable<Integer> {
 
             if (packet != null) {
                 handlePacket(packet);
-                num++;
-                if (num % 1_000_000 == 0) {
-                    log.info("received packets: {}", num);
-                }
-                if (maxPacketCount != -1 && num >= maxPacketCount) {
+                if (maxPacketCount != -1 && handledPacketCount >= maxPacketCount) {
                     break;
                 }
             }

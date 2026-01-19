@@ -94,23 +94,21 @@ public class ToRedisReplayer {
     private final int writeScale;
     private final int sendCmdBatchSize;
     private final boolean isUseLettuce;
-    private final boolean isDebug;
     private final SplitFileAppender appender;
 
     public ToRedisReplayer(String targetHost, int targetPort, int readScale, int writeScale,
-                           int sendCmdBatchSize, boolean isUseLettuce, boolean isDebug, SplitFileAppender appender) {
+                           int sendCmdBatchSize, boolean isUseLettuce, SplitFileAppender appender) {
         this.targetHost = targetHost;
         this.targetPort = targetPort;
         this.readScale = readScale;
         this.writeScale = writeScale;
         this.sendCmdBatchSize = sendCmdBatchSize;
         this.isUseLettuce = isUseLettuce;
-        this.isDebug = isDebug;
         this.appender = appender;
     }
 
     public void initializeConnections() {
-        if (isDebug) {
+        if (appender != null) {
             return;
         }
 
@@ -145,7 +143,7 @@ public class ToRedisReplayer {
     }
 
     public void closeConnections() {
-        if (isDebug) {
+        if (appender != null) {
             return;
         }
 
@@ -183,7 +181,7 @@ public class ToRedisReplayer {
     }
 
     public int forwardCommand(CmdArgs cmdArgs, boolean isRead) throws IOException {
-        if (isDebug) {
+        if (appender != null) {
             var sb = new StringBuilder();
             sb.append(cmdArgs.cmd());
             sb.append(" ");

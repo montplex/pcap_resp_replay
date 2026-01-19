@@ -1,7 +1,7 @@
 # Guide
 
 This is a tool project using pcap library to parse RESP protocol and then replay to a target redis-compatible server.
-This tool is also support dump the tcp packet and send to kafka. Later we can consume data from kafka and do analysis.
+This tool is also support dump the tcp packet and send to kafka or save to local file. Later we can consume data from kafka or local file and do analysis.
 
 # Architecture
 
@@ -21,14 +21,14 @@ Send tcp packet to kafka:
 graph LR
     A[Network Interface] --> B[TCP Packet Capture]
     B --> C[TCP Packet Parse]
-    C --> D[Send to Kafka broker]
+    C --> D[Send to Kafka broker / Save to local file]
 ```
 
 Consume tcp packet from kafka:
 
 ```mermaid
 graph LR
-    A[Kafka broker] --> B[Consume TCP Packet]
+    A[Kafka broker / Local file] --> B[Consume TCP Packet]
     B --> C[RESP Decode]
     C --> D[Print or Do analysis]
 ```
@@ -75,7 +75,7 @@ java -jar pcap_resp_replay-1.0.0.jar --help
 Command-line interface documentation:
 
 ```
-Usage: java -jar pcap_resp_replay-1.0.0.jar [-CdD] [-b=<bufferSize>]
+Usage: java -jar pcap_resp_replay-1.0.0.jar [-CDL] [-b=<bufferSize>]
        [-B=<sendCmdBatchSize>] [-c=<maxPacketCount>] [-f=<filter>]
        [-g=<kafkaGroupId>] [-h=<host>] [-H=<targetHost>] [-i=<itf>]
        [-k=<kafkaBroker>] [-m=<bigKeyTopNum>] [-n=<consumeMaxNum>]
@@ -91,8 +91,6 @@ TCP monitor / filter and then replay / redirect to target redis server or kafka.
   -c, --max-packet-count=<maxPacketCount>
                           receive max packet count, default: -1, means not limit
   -C, --pipe-consumer     pipe consumer from kafka, default: false
-  -d, --debug             debug mode, if true, just log resp data, skip execute
-                            to target redis server
   -D, --pipe-dump         pipe dump to kafka, default: false
   -f, --filter=<filter>   filter, default: tcp dst port 6379
   -g, --kafka-group-id=<kafkaGroupId>
@@ -104,6 +102,7 @@ TCP monitor / filter and then replay / redirect to target redis server or kafka.
   -i, --interface=<itf>   interface, eg: lo, default: lo
   -k, --kafka-broker=<kafkaBroker>
                           kafka broker, eg: localhost:9092
+  -L, --pipe-dump-local   pipe dump to local file, default: false
   -m, --big-key-top-num=<bigKeyTopNum>
                           big key top num, default: 10, max 100
   -n, --pipe-consume-max-num=<consumeMaxNum>
