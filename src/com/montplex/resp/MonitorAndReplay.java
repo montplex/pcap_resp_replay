@@ -2,6 +2,7 @@ package com.montplex.resp;
 
 import com.montplex.consume.FromKafkaConsumer;
 import com.montplex.monitor.BigKeyTopK;
+import com.montplex.pipe.SplitFileAppender;
 import com.montplex.pipe.ToKafkaSender;
 import com.montplex.replay.ToRedisReplayer;
 import com.montplex.tools.TablePrinter;
@@ -20,7 +21,6 @@ import picocli.CommandLine;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.exceptions.JedisConnectionException;
 
-import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -204,7 +204,7 @@ public class MonitorAndReplay implements Callable<Integer> {
     private final TreeMap<String, Long> countByCmd = new TreeMap<>();
     private BigKeyTopK bigKeyTopK;
 
-    private FileWriter debugOutputFileWriter;
+    private SplitFileAppender appender;
 
     private volatile boolean stop = false;
 
@@ -276,7 +276,8 @@ public class MonitorAndReplay implements Callable<Integer> {
         }
 
         if (isDebug) {
-            debugOutputFileWriter = new FileWriter("debug.txt", false);
+            appender = new SplitFileAppender(512 * 1024 * 1024);
+            appender.initWhenFirstTimeUse();
         }
 
         if (isPipeDump) {
@@ -313,7 +314,7 @@ public class MonitorAndReplay implements Callable<Integer> {
             }
 
             bigKeyTopK = new BigKeyTopK(bigKeyTopNum);
-            replayer = new ToRedisReplayer(targetHost, targetPort, readScale, writeScale, sendCmdBatchSize, isUseLettuce, isDebug, debugOutputFileWriter);
+            replayer = new ToRedisReplayer(targetHost, targetPort, readScale, writeScale, sendCmdBatchSize, isUseLettuce, isDebug, appender);
             replayer.initializeConnections();
         }
 
@@ -398,8 +399,8 @@ public class MonitorAndReplay implements Callable<Integer> {
 
         scheduler.shutdown();
 
-        if (debugOutputFileWriter != null) {
-            debugOutputFileWriter.close();
+        if (appender != null) {
+            appender.close();
         }
 
         if (sender != null) {

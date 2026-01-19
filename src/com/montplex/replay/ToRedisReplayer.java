@@ -1,5 +1,6 @@
 package com.montplex.replay;
 
+import com.montplex.pipe.SplitFileAppender;
 import com.montplex.resp.CmdArgs;
 import com.montplex.resp.ExtendCommand;
 import io.lettuce.core.RedisClient;
@@ -17,7 +18,6 @@ import redis.clients.jedis.Jedis;
 import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.exceptions.JedisException;
 
-import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -95,10 +95,10 @@ public class ToRedisReplayer {
     private final int sendCmdBatchSize;
     private final boolean isUseLettuce;
     private final boolean isDebug;
-    private final FileWriter debugOutputFileWriter;
+    private final SplitFileAppender appender;
 
     public ToRedisReplayer(String targetHost, int targetPort, int readScale, int writeScale,
-                           int sendCmdBatchSize, boolean isUseLettuce, boolean isDebug, FileWriter debugOutputFileWriter) {
+                           int sendCmdBatchSize, boolean isUseLettuce, boolean isDebug, SplitFileAppender appender) {
         this.targetHost = targetHost;
         this.targetPort = targetPort;
         this.readScale = readScale;
@@ -106,7 +106,7 @@ public class ToRedisReplayer {
         this.sendCmdBatchSize = sendCmdBatchSize;
         this.isUseLettuce = isUseLettuce;
         this.isDebug = isDebug;
-        this.debugOutputFileWriter = debugOutputFileWriter;
+        this.appender = appender;
     }
 
     public void initializeConnections() {
@@ -195,7 +195,8 @@ public class ToRedisReplayer {
                 }
             }
             sb.append("\n");
-            debugOutputFileWriter.write(sb.toString());
+            appender.writeInt(sb.length());
+            appender.writeBytes(sb.toString().getBytes());
             return isRead ? readScale : writeScale;
         }
 
