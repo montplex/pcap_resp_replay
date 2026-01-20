@@ -11,45 +11,26 @@ import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 
-/**
- * SplitFileAppender handles file output stream operations with automatic file splitting
- * when the file size reaches the configured threshold.
- */
 public class SplitFileAppender {
 
     private final Logger log = LoggerFactory.getLogger(SplitFileAppender.class);
 
-    // File name prefix for generated log files
     private final String fileNamePrefix = "all_cmd_log.";
 
-    // Current file being written to
     private File currentFile;
 
-    // Output stream for writing data to file
     private BufferedOutputStream out;
 
-    // Current file size in bytes
     private long fileSize = 0L;
 
-    // Maximum file size before splitting occurs (default 512MB)
-    private int splitSize;
+    private final int splitSize;
 
-    // Date formatter for generating unique file names
     private final SimpleDateFormat dateFormat = new SimpleDateFormat("yyyyMMddHHmmss");
 
-    /**
-     * Constructor to initialize the SplitFileAppender with the specified split size
-     *
-     * @param splitSize maximum file size before splitting (in bytes)
-     */
     public SplitFileAppender(int splitSize) {
         this.splitSize = splitSize;
     }
 
-    /**
-     * Initializes the file appender by finding or creating a file to write to
-     * Sets up shutdown hook to properly close streams on application exit
-     */
     public void initWhenFirstTimeUse(long beginMillis) {
         if (currentFile != null) {
             return;
@@ -119,12 +100,6 @@ public class SplitFileAppender {
         }
     }
 
-    /**
-     * Writes an integer value to the file as 4-byte representation
-     *
-     * @param i the integer value to write
-     * @throws IOException if an I/O error occurs
-     */
     public void writeInt(int i) throws IOException {
         byte[] bb = new byte[4];
         ByteBuffer.wrap(bb).putInt(i);
@@ -132,12 +107,6 @@ public class SplitFileAppender {
         fileSize += 4;
     }
 
-    /**
-     * Writes a long value to the file as 8-byte representation
-     *
-     * @param l the long value to write
-     * @throws IOException if an I/O error occurs
-     */
     public void writeLong(long l) throws IOException {
         byte[] bb = new byte[8];
         ByteBuffer.wrap(bb).putLong(l);
@@ -145,22 +114,11 @@ public class SplitFileAppender {
         fileSize += 8;
     }
 
-    /**
-     * Writes raw bytes to the output stream and updates file size tracking
-     *
-     * @param bytes the bytes to write
-     * @throws IOException if an I/O error occurs
-     */
     public void writeBytes(byte[] bytes) throws IOException {
         out.write(bytes);
         fileSize += bytes.length;
     }
 
-    /**
-     * Checks if the current file size exceeds the split threshold and creates a new file if needed
-     *
-     * @throws IOException if an I/O error occurs during file operations
-     */
     public void checkIfNeedSplitFile() throws IOException {
         if (fileSize < splitSize) {
             return;
@@ -187,49 +145,24 @@ public class SplitFileAppender {
         log.warn("SplitFileAppender split file, rename: {}, create file name: {}", renameResult, nextFile.getName());
     }
 
-    /**
-     * Generates a unique file name based on current time and thread ID
-     *
-     * @return the generated file name
-     */
     private String generateFileName() {
         Date now = new Date();
         long threadId = Thread.currentThread().getId();
         return fileNamePrefix + now.getTime() + "." + dateFormat.format(now) + "." + threadId + ".dat";
     }
 
-    /**
-     * Returns the current file being written to
-     *
-     * @return the current file
-     */
     public File getCurrentFile() {
         return currentFile;
     }
 
-    /**
-     * Returns the current file size
-     *
-     * @return the current file size in bytes
-     */
     public long getFileSize() {
         return fileSize;
     }
 
-    /**
-     * Flushes the output stream to ensure all buffered data is written to file
-     *
-     * @throws IOException if an I/O error occurs
-     */
     public void flush() throws IOException {
         out.flush();
     }
 
-    /**
-     * Closes the output stream
-     *
-     * @throws IOException if an I/O error occurs
-     */
     public void close() throws IOException {
         if (out != null) {
             out.close();
